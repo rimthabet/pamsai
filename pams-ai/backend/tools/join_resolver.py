@@ -1,4 +1,3 @@
-# tools/join_resolver.py
 from __future__ import annotations
 from collections import deque
 from typing import List, Optional, Dict, Tuple
@@ -14,7 +13,7 @@ def shortest_path_fk(graph: SchemaGraph, src: str, dst: str) -> Optional[List[FK
         return []
 
     q = deque([src])
-    prev: Dict[str, Tuple[str, FKEdge]] = {}  # node -> (prev_node, edge_used)
+    prev: Dict[str, Tuple[str, FKEdge]] = {}  
 
     while q:
         cur = q.popleft()
@@ -24,7 +23,6 @@ def shortest_path_fk(graph: SchemaGraph, src: str, dst: str) -> Optional[List[FK
                 continue
             prev[nxt] = (cur, e)
             if nxt == dst:
-                # reconstruct
                 path: List[FKEdge] = []
                 node = dst
                 while node != src:

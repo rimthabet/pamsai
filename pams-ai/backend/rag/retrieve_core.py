@@ -175,7 +175,7 @@ def keyword_lookup(entity_hint: str, source_types: List[str], limit: int = 5) ->
 # ----------------------------
 # Semantic retrieval (pgvector)
 # -----------------------------
-def semantic_retrieve(query: str, top_k: int = 8, source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def semantic_retrieve(query: str, top_k: int = 10 ,source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     model = _get_embed_model()
     qvec = model.encode([query], normalize_embeddings=True)[0].tolist()
 
@@ -226,7 +226,7 @@ def semantic_retrieve(query: str, top_k: int = 8, source_types: Optional[List[st
 # -----------------------------
 def hybrid_retrieve(
     query: str,
-    top_k: int = 8,
+    top_k: int = 10,
     source_types: Optional[List[str]] = None,
     entity_hint: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:

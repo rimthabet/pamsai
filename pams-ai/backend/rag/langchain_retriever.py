@@ -26,7 +26,7 @@ def _chunks_to_docs(chunks, top_k: int) -> List[Document]:
     return docs
 
 
-def _retrieve_docs(query: str, top_k: int = 8, source_types: Optional[List[str]] = None) -> List[Document]:
+def _retrieve_docs(query: str, top_k: int = 10, source_types: Optional[List[str]] = None) -> List[Document]:
     hint = extract_entity_hint(query)
 
     chunks, scope, domain = hybrid_retrieve(
@@ -44,7 +44,7 @@ def _retrieve_docs(query: str, top_k: int = 8, source_types: Optional[List[str]]
     return docs
 
 
-def make_retriever(top_k: int = 8, source_types: Optional[List[str]] = None):
+def make_retriever(top_k: int = 10, source_types: Optional[List[str]] = None):
     """
     Retourne un "retriever" compatible LangChain (Runnable).
     - invoke(question) -> List[Document]

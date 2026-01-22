@@ -54,7 +54,7 @@ def docs_to_chunks(docs: List[Document]) -> List[Dict[str, Any]]:
     return out
 
 
-def answer(question: str, top_k: int = 8, model: str = "llama3.2") -> str:
+def answer(question: str, top_k: int = 10, model: str = "llama3.2") -> str:
     retriever = make_retriever(top_k=top_k)
     docs = retriever.invoke(question)
 

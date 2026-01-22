@@ -1,21 +1,14 @@
-# app/chat_service.py
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import re
 
 from rag.retrieve_core import hybrid_retrieve
 from rag.answer import structured_answer_from_chunks
 from rag.langchain_answer import answer as lc_rag_answer
+from agent.lc_agent import run_agent
 
-from tools.kpi_router import route_kpi
-from tools.kpi_service import run_kpi, render_kpi_answer
-
-from tools.relational_qa import relational_answer_one_line
-
-# optionnel (si tu as un agent tool-calling)
-try:
-    from agent.lc_agent import run_agent
-except Exception:
-    run_agent = None
+from tools.analytics_parser import parse_intent
+from tools.analytics_service import run_analytics
+from tools.sql_ai_engine import try_answer_sql
 
 
 def _sources_from_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -54,9 +47,18 @@ def _detect_crud_intent(message: str) -> bool:
     return bool(re.search(r"\b(ajoute|ajouter|crée|creer|modifier|supprimer|mets à jour|mettre à jour)\b", message or "", re.I))
 
 
-def _detect_definition_intent(message: str) -> bool:
-    # ex: "c'est quoi un fonds", "définition fonds"
-    return bool(re.search(r"\b(c['’]est quoi|ça veut dire|definition|définition)\b", message or "", re.I))
+def _early_rel_analytics(message: str) -> Optional[Dict[str, Any]]:
+    intent = parse_intent(message or "")
+    if not intent or intent.kind != "rel":
+        return None
+    if not intent.entity_table or not intent.attr_table:
+        return None
+    if not intent.entity_name:
+        return None
+    a = run_analytics(message, debug=False)
+    if a and a.get("ok"):
+        return a
+    return None
 
 
 def chat_pipeline(
@@ -67,89 +69,71 @@ def chat_pipeline(
     debug: bool = False,
     mode: str = "rag",
 ) -> Dict[str, Any]:
-    """
-    Router:
-      1) reporting
-      2) crud
-      3) KPI (SQL déterministe)
-      4) Relational QA (SQL + joins FK automatiques)
-      5) mode agent (si activé)
-      6) RAG (structured-first -> LLM fallback)
-    """
 
-    msg = message or ""
-
-    # 1) reporting
-    if _detect_report_intent(msg):
+    if _detect_report_intent(message):
         return {
             "answer": "Je peux générer un reporting. Dis-moi le fonds/période et le format (PDF/Excel).",
             "sources": [],
             "suggested_actions": [{"type": "report", "payload": {"name": "ask_user_params"}}],
             "navigation": [],
-            "used": {"mode": "router:report"},
+            "used": {"mode": "router:report_hint", "debug": debug},
         }
 
-    # 2) crud
-    if _detect_crud_intent(msg) and role != "viewer":
+    if _detect_crud_intent(message) and role != "viewer":
         return {
             "answer": "Je peux t’aider à faire cette action. Donne les champs et tu confirmeras avant enregistrement.",
             "sources": [],
             "suggested_actions": [{"type": "crud", "payload": {"name": "draft_action_from_user"}}],
             "navigation": [],
-            "used": {"mode": "router:crud"},
+            "used": {"mode": "router:crud_hint", "debug": debug},
         }
 
-    # 3) définitions générales (sans doc)
-    if _detect_definition_intent(msg) and re.search(r"\b(fonds|fond)\b", msg, re.I):
+    if mode == "agent":
+        res = run_agent(message, model=model, role=role)
+        text = res.get("text") or "Je ne sais pas d’après les données disponibles."
         return {
-            "answer": "Un fonds d’investissement est un véhicule qui collecte l’argent de souscripteurs pour l’investir selon une stratégie, avec des règles (durée, frais, ratios) et du reporting.",
+            "answer": text,
             "sources": [],
             "suggested_actions": [],
             "navigation": [],
-            "used": {"mode": "router:definition"},
+            "used": {"mode": "agent-tools", "model": model, "role": role, "debug": debug},
         }
 
-    # 4) KPI déterministe
-    kpi_name = route_kpi(msg)
-    if kpi_name:
-        res = run_kpi(msg)  # IMPORTANT: si None => fallback
-        if res is not None:
-            return {
-                "answer": render_kpi_answer(res),
-                "sources": [],
-                "suggested_actions": [],
-                "navigation": [],
-                "used": {"mode": "router:kpi", "kpi": kpi_name, "year": res.get("year"), "debug": debug, "kpi_debug": res.get("debug", {}) if debug else {}},
-            }
-
-    # 5) Relational QA (FK joins auto) => 1 phrase
-    rel = relational_answer_one_line(msg)
-    if rel:
+    early = _early_rel_analytics(message)
+    if early:
         return {
-            "answer": rel,
+            "answer": early["text"],
             "sources": [],
             "suggested_actions": [],
             "navigation": [],
-            "used": {"mode": "router:relational_qa"},
+            "used": early.get("used") or {"mode": "analytics:rel", "debug": debug},
         }
 
-    # 6) mode agent (si tu veux)
-    if mode == "agent" and run_agent is not None:
-        res = run_agent(msg, model=model, role=role)
+    a = run_analytics(message, debug=debug)
+    if a and a.get("ok"):
         return {
-            "answer": (res.get("text") or "Je ne sais pas d’après les données disponibles.").strip(),
+            "answer": a["text"],
             "sources": [],
-            "suggested_actions": res.get("actions", []) or [],
-            "navigation": res.get("navigation", []) or [],
-            "used": {"mode": "agent-tools", "model": model, "role": role},
+            "suggested_actions": [],
+            "navigation": [],
+            "used": a.get("used") or {"mode": "analytics", "debug": debug},
         }
 
-    # 7) RAG normal
-    chunks, scope, domain = hybrid_retrieve(msg, top_k=top_k)
+    s = try_answer_sql(message, debug=debug)
+    if s and s.get("ok"):
+        return {
+            "answer": s["text"],
+            "sources": [],
+            "suggested_actions": [],
+            "navigation": [],
+            "used": s.get("used") or {"mode": "sql", "debug": debug},
+        }
+
+    chunks, scope, domain = hybrid_retrieve(message, top_k=top_k)
     sources = _sources_from_chunks(chunks)
     navigation = _suggest_navigation(chunks)
 
-    structured = structured_answer_from_chunks(msg, chunks)
+    structured = structured_answer_from_chunks(message, chunks)
     if structured:
         return {
             "answer": structured,
@@ -159,7 +143,7 @@ def chat_pipeline(
             "used": {"mode": "structured-first", "domain": domain, "scope": scope, "top_k": top_k, "debug": debug},
         }
 
-    llm_text = lc_rag_answer(msg, top_k=top_k, model=model)
+    llm_text = lc_rag_answer(message, top_k=top_k, model=model)
     return {
         "answer": llm_text,
         "sources": sources,

@@ -16,12 +16,16 @@ RX_NOMME = re.compile(r"\b(nomm[eé]|appel[eé])\s+(.+?)(\?|$)", re.I)
 RX_QUOTE = re.compile(r'"([^"]{3,})"')
 
 RX_REL = re.compile(
-    r"\b(qui\s+est|quel(le)?\s+est)\s+(?P<attr>[a-zA-Z_éèêàç\- ]{2,}?)\s+(du|de\s+la|de\s+l')\s+(?P<entity>[a-zA-Z_]+)",
+    r"\b(qui\s+est|quel(le)?\s+est)\s+(?P<attr>[a-zA-Z_éèêàç\- ]{2,}?)\s+(du|de\s+la|de\s+l'|de)\s+(?P<entity>[a-zA-Z_]+)",
     re.I
 )
 
-RX_SOUSCRIPTION = re.compile(r"\b(souscription|souscriptions)\b", re.I)
-RX_FONDS_REF = re.compile(r"\b(fonds|fond)\s+(?P<name>.+?)(\b(pour|en|sur)\b|\b(19\d{2}|20\d{2})\b|\?|$)", re.I)
+RX_FUND_NAME = re.compile(
+    r"\b(?:fonds|fond)\b(?:\s+(?:nomm[eé]|appel[eé]))?\s+(?P<name>.+?)(?:\s+(?:pour|en|de|du|des)\b|[?]|$)",
+    re.I
+)
+
+STOP_ARTICLES = re.compile(r"^(le|la|les|l')\s+", re.I)
 
 @dataclass
 class AnalyticsIntent:
@@ -31,7 +35,7 @@ class AnalyticsIntent:
     entity_table: Optional[str] = None
     entity_name: Optional[str] = None
     attr_table: Optional[str] = None
-    target_table: Optional[str] = None
+    fund_name: Optional[str] = None
     raw: str = ""
 
 def extract_year(q: str) -> Optional[int]:
@@ -39,30 +43,65 @@ def extract_year(q: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def extract_entity_name(q: str) -> Optional[str]:
-    q = (q or "").strip()
-    m = RX_QUOTE.search(q)
+    q0 = (q or "").strip()
+    m = RX_QUOTE.search(q0)
     if m:
         return m.group(1).strip()
-    m = RX_NOMME.search(q)
+    m = RX_NOMME.search(q0)
     if m:
         return m.group(2).strip().strip('"').strip("'")
     return None
 
-def extract_fund_name(q: str) -> Optional[str]:
-    q = (q or "").strip()
-    m = RX_FONDS_REF.search(q)
+def extract_name_after_entity(q: str, entity: str) -> Optional[str]:
+    q0 = (q or "").strip()
+    if not entity:
+        return None
+    m = re.search(rf"\b{re.escape(entity)}\b\s+(?P<name>.+?)(?:\?|$)", q0, re.I)
     if not m:
         return None
-    name = (m.group("name") or "").strip().strip('"').strip("'")
+    name = (m.group("name") or "").strip()
+    name = re.sub(r"\s+", " ", name).strip().strip('"\'')
+
+    name = re.sub(r"^(nomm[eé]|appel[eé])\s+", "", name, flags=re.I).strip()
+
+    name = re.sub(r"\b(pour|en|de|du|des)\b.*$", "", name, flags=re.I).strip()
     return name if len(name) >= 3 else None
 
+def extract_fund_name(q: str) -> Optional[str]:
+    q0 = (q or "").strip()
+    if re.search(r"\b(fonds|fond)\b", q0, re.I):
+        m = RX_QUOTE.search(q0)
+        if m:
+            return m.group(1).strip()
+
+    m = RX_FUND_NAME.search(q0)
+    if not m:
+        return None
+
+    name = (m.group("name") or "").strip()
+    name = re.sub(r"\s+", " ", name).strip().strip('"\'')
+
+    name = re.sub(r"\b(pour|en|de|du|des)\b.*$", "", name, flags=re.I).strip()
+    return name if len(name) >= 3 else None
+
+def normalize_attr(attr: str) -> str:
+    a = (attr or "").strip()
+    a = STOP_ARTICLES.sub("", a).strip()
+    a = re.sub(r"\s+", " ", a)
+    return a.replace(" ", "_").replace("-", "_").lower()
+
 def detect_agg(q: str) -> Optional[str]:
-    q = q or ""
-    if RX_SUM.search(q): return "sum"
-    if RX_COUNT.search(q): return "count"
-    if RX_AVG.search(q): return "avg"
-    if RX_MIN.search(q): return "min"
-    if RX_MAX.search(q): return "max"
+    q0 = q or ""
+    if RX_SUM.search(q0):
+        return "sum"
+    if RX_COUNT.search(q0):
+        return "count"
+    if RX_AVG.search(q0):
+        return "avg"
+    if RX_MIN.search(q0):
+        return "min"
+    if RX_MAX.search(q0):
+        return "max"
     return None
 
 def parse_intent(message: str) -> Optional[AnalyticsIntent]:
@@ -70,25 +109,31 @@ def parse_intent(message: str) -> Optional[AnalyticsIntent]:
 
     m = RX_REL.search(q)
     if m:
-        attr = (m.group("attr") or "").strip().lower()
+        attr_raw = (m.group("attr") or "").strip()
         entity = (m.group("entity") or "").strip().lower()
+
         name = extract_entity_name(q)
+        if not name:
+            name = extract_name_after_entity(q, entity)
+
         return AnalyticsIntent(
             kind="rel",
             entity_table=entity,
             entity_name=name,
-            attr_table=attr.replace(" ", "_").replace("-", "_"),
+            attr_table=normalize_attr(attr_raw),
             year=extract_year(q),
+            fund_name=extract_fund_name(q),
             raw=q,
         )
 
     agg = detect_agg(q)
     if agg:
-        it = AnalyticsIntent(kind="agg", agg=agg, year=extract_year(q), raw=q)
-        if RX_SOUSCRIPTION.search(q):
-            it.target_table = "souscription"
-            it.entity_table = "fonds"
-            it.entity_name = extract_entity_name(q) or extract_fund_name(q)
-        return it
+        return AnalyticsIntent(
+            kind="agg",
+            agg=agg,
+            year=extract_year(q),
+            fund_name=extract_fund_name(q),
+            raw=q,
+        )
 
     return None

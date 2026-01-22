@@ -8,7 +8,16 @@ from sqlalchemy import text
 from app.db import engine
 
 from tools.analytics_schema import load_schema, get_display_column, SchemaCache, ForeignKey
+from typing import Any, Dict, List
+from sqlalchemy import text
+from app.db import engine
 
+
+
+def run_sql_many(sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
 
 def _ident(name: str) -> str:
     """

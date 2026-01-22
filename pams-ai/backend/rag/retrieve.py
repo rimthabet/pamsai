@@ -4,7 +4,7 @@ from rag.retrieve_core import hybrid_retrieve, auto_source_types, semantic_retri
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("query", type=str)
-    p.add_argument("-k", "--top_k", type=int, default=8)
+    p.add_argument("-k", "--top_k", type=int, default=10)
     p.add_argument("--source_type", type=str, default="")
     p.add_argument("--no_auto_scope", action="store_true")
     args = p.parse_args()
