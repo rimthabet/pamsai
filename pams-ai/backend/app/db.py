@@ -1,5 +1,7 @@
 import os
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text , event
+from pgvector.psycopg2 import register_vector
+
 
 DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://postgres:rimthabet@localhost:5432/maxula")
 engine = create_engine(DB_URL, pool_pre_ping=True)
@@ -19,3 +21,10 @@ def init_db():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS rag_chunks_vec_idx ON rag_chunks USING ivfflat (embedding vector_cosine_ops);"))
 
+
+
+
+
+@event.listens_for(engine, "connect")
+def _register_pgvector(dbapi_conn, _):
+    register_vector(dbapi_conn)

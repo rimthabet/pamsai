@@ -6,9 +6,14 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 
 from app.chat_service import chat_pipeline
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+
+
 
 app = FastAPI(title="PAMS-AI Agent")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,6 +21,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+#app = FastAPI() 
+#app.add_middleware(
+   # CORSMiddleware,
+    #allow_origins=[
+    #    "http://localhost:4200",
+     #   "http://127.0.0.1:4200",
+    #],
+    #allow_credentials=True,
+    #allow_methods=["*"],
+    #allow_headers=["*"],
+##)
+
+# routes
+#@app.post("/chat")
+#def chat(payload: dict):
+   # return {
+          #"answer": "OK",
+        #"used": {"mode": "test"}
+    #}
 
 
 class ChatRequest(BaseModel):

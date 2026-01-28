@@ -9,35 +9,24 @@ import pytesseract
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import text
 from app.db import engine, init_db
-
-from pgvector import Vector
 from pgvector.psycopg2 import register_vector
 
-# -----------------------------
-# CONFIG 
-# -----------------------------
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\rthabet\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 os.environ["TESSDATA_PREFIX"] = r"C:\Users\rthabet\AppData\Local\Programs\Tesseract-OCR\tessdata"
 
 MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 
-# OCR
 OCR_LANG = "fra+eng"
 PDF_DPI = 400
 TESS_CONFIG = "--oem 1 --psm 6"
 
-# Chunking
 MAX_CHARS = 1400
 OVERLAP = 200
 
-# Qualité chunks
 MIN_CHUNK_CHARS = 250
 MIN_ALPHA_RATIO = 0.55
 
 
-# -----------------------------
-# RAG SOURCES TABLE 
-# -----------------------------
 def ensure_rag_sources(conn):
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS rag_sources (
@@ -90,9 +79,7 @@ def mark_indexed(conn, source_type: str, source_id: str, checksum: str, meta: di
         }
     )
 
-# -----------------------------
-# nettoyage et filtrage
-# -----------------------------
+
 def normalize_text(t: str) -> str:
     t = (t or "").replace("\x0c", " ")
     t = re.sub(r"[ \t]+", " ", t)
@@ -133,9 +120,6 @@ def is_good_chunk(t: str) -> bool:
     return True
 
 
-# -----------------------------
-# Chunking 
-# -----------------------------
 def smart_chunks(text_in: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> List[str]:
     text_in = (text_in or "").strip()
     if not text_in:
@@ -171,9 +155,6 @@ def smart_chunks(text_in: str, max_chars: int = MAX_CHARS, overlap: int = OVERLA
     return [c for c in chunks if is_good_chunk(c)]
 
 
-# -----------------------------
-# OCR page par page + prétraitement
-# -----------------------------
 def preprocess_for_ocr(img):
     img = ImageOps.grayscale(img)
     img = img.point(lambda x: 0 if x < 160 else 255, "1")
@@ -206,8 +187,6 @@ def main():
     with engine.begin() as conn:
         ensure_rag_sources(conn)
 
-        # pgvector adapter
-        
         dbapi_conn = conn.connection.driver_connection if hasattr(conn.connection, "driver_connection") else conn.connection.connection
         register_vector(dbapi_conn)
 
@@ -215,7 +194,6 @@ def main():
             base = os.path.basename(pdf)
             chk = file_sha256(pdf)
 
-            
             if already_indexed_same_checksum(conn, "pdf_ocr", base, chk):
                 print(f"⏭️ Skip (inchangé) : {base}")
                 continue
@@ -227,7 +205,6 @@ def main():
                 print(f" Aucun texte OCR détecté : {base}")
                 continue
 
-            
             conn.execute(
                 text("DELETE FROM rag_chunks WHERE source_type='pdf_ocr' AND source_id=:sid"),
                 {"sid": base}
@@ -246,7 +223,7 @@ def main():
                     conn.execute(
                         text("""
                             INSERT INTO rag_chunks(source_type, source_id, content, metadata, embedding)
-                            VALUES (:st, :sid, :content, CAST(:meta AS jsonb), :emb)
+                            VALUES (:st, :sid, :content, CAST(:meta AS jsonb), CAST(:emb AS vector))
                         """),
                         {
                             "st": "pdf_ocr",
@@ -264,12 +241,11 @@ def main():
                                 },
                                 ensure_ascii=False
                             ),
-                            "emb": Vector(vec.tolist())
+                            "emb": vec.tolist()
                         }
                     )
                 total_chunks += len(chunks)
 
-            
             mark_indexed(
                 conn,
                 "pdf_ocr",

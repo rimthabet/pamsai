@@ -8,7 +8,8 @@ from sqlalchemy.engine import Engine
 from sentence_transformers import SentenceTransformer
 
 from app.db import engine as vec_engine, init_db
-from pgvector import Vector
+#from pgvector import Vector
+from pgvector.sqlalchemy import Vector
 from pgvector.psycopg2 import register_vector
 
 
@@ -104,7 +105,6 @@ def get_pk_columns(engine: Engine, table_name: str) -> List[str]:
 
 
 def delete_existing(conn_vec, table_name: str):
-    # supprime l'index déjà existant pour cette table 
     conn_vec.execute(
         text("DELETE FROM rag_chunks WHERE source_type = :st"),
         {"st": f"maxula:{table_name}"}
@@ -150,14 +150,11 @@ def main():
         for tname in tables:
             pk_cols = get_pk_columns(maxula_engine, tname)
             print(f"\nIndexation table: {tname} (PK={pk_cols if pk_cols else 'aucune'})")
-
-            # rebuild complet table
             delete_existing(conn_vec, tname)
 
             meta = MetaData()
             table = Table(tname, meta, autoload_with=maxula_engine)
 
-            # lecture limitée pour éviter explosion
             stmt = select(table).limit(ROW_LIMIT_PER_TABLE)
 
             docs_batch = []
