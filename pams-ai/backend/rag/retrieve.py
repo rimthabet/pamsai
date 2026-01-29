@@ -1,6 +1,7 @@
 import argparse
 from rag.retrieve_core import hybrid_retrieve, auto_source_types, semantic_retrieve
 
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("query", type=str)

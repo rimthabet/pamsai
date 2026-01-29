@@ -3,12 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
+
 from sqlalchemy import text
 from app.db import engine
 
 
 RX_YEAR = re.compile(r"\b(19\d{2}|20\d{2})\b")
-RX_LIST = re.compile(r"\b(liste|tous|toutes|affiche|donne)\b", re.I)
+RX_LIST = re.compile(r"\b(liste|tous|toutes)\b", re.I)
 RX_TOTAL = re.compile(r"\b(total|somme|montant\s+total|global)\b", re.I)
 RX_WHO_IS = re.compile(r"\b(qui\s+est|c'?est\s+qui)\b", re.I)
 RX_OF = re.compile(r"\b(du|de\s+la|de\s+l')\b", re.I)
@@ -19,7 +20,7 @@ RX_MONTANT = re.compile(r"\bmontant\b", re.I)
 
 STOP_ATTR = {"nom", "denomination", "alias", "id"}
 
-DEFAULT_LIST_LIMIT = 2000
+DEFAULT_LIST_LIMIT = 1000
 HARD_LIST_LIMIT = 5000
 
 
@@ -68,29 +69,43 @@ def load_schema(force: bool = False) -> Schema:
         return _SCHEMA_CACHE
 
     with engine.begin() as conn:
-        tables = conn.execute(text("""
+        tables = conn.execute(
+            text(
+                """
             SELECT table_name
             FROM information_schema.tables
             WHERE table_schema = 'public' AND table_type='BASE TABLE'
-        """)).scalars().all()
+        """
+            )
+        ).scalars().all()
 
-        cols_rows = conn.execute(text("""
+        cols_rows = conn.execute(
+            text(
+                """
             SELECT table_name, column_name, data_type
             FROM information_schema.columns
             WHERE table_schema = 'public'
             ORDER BY table_name, ordinal_position
-        """)).mappings().all()
+        """
+            )
+        ).mappings().all()
 
-        pk_rows = conn.execute(text("""
+        pk_rows = conn.execute(
+            text(
+                """
             SELECT tc.table_name, kcu.column_name
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
               ON tc.constraint_name = kcu.constraint_name
              AND tc.table_schema = kcu.table_schema
             WHERE tc.table_schema='public' AND tc.constraint_type='PRIMARY KEY'
-        """)).mappings().all()
+        """
+            )
+        ).mappings().all()
 
-        fk_rows = conn.execute(text("""
+        fk_rows = conn.execute(
+            text(
+                """
             SELECT
               tc.table_name AS src_table,
               kcu.column_name AS src_col,
@@ -104,7 +119,9 @@ def load_schema(force: bool = False) -> Schema:
               ON ccu.constraint_name = tc.constraint_name
              AND ccu.table_schema = tc.table_schema
             WHERE tc.table_schema='public' AND tc.constraint_type='FOREIGN KEY'
-        """)).mappings().all()
+        """
+            )
+        ).mappings().all()
 
     cols: Dict[str, List[Tuple[str, str]]] = {}
     for r in cols_rows:
@@ -159,13 +176,15 @@ def _bfs_fk_path(schema: Schema, start: str, goal: str, max_hops: int = 3) -> Op
     adj: Dict[str, List[FKEdge]] = {}
     for e in schema.fks:
         adj.setdefault(e.src_table, []).append(e)
+        # reverse edge for traversal
         adj.setdefault(e.dst_table, []).append(FKEdge(e.dst_table, e.dst_col, e.src_table, e.src_col))
 
     from collections import deque
-    dq = deque([(start, [])])
+
+    q = deque([(start, [])])
     seen = {start}
-    while dq:
-        node, path = dq.popleft()
+    while q:
+        node, path = q.popleft()
         if len(path) >= max_hops:
             continue
         for e in adj.get(node, []):
@@ -176,11 +195,18 @@ def _bfs_fk_path(schema: Schema, start: str, goal: str, max_hops: int = 3) -> Op
             if nxt == goal:
                 return npath
             seen.add(nxt)
-            dq.append((nxt, npath))
+            q.append((nxt, npath))
     return None
 
 
-def _build_join_sql(schema: Schema, base_table: str, target_table: str, base_filter_sql: str, base_params: Dict[str, Any], select_expr: str) -> Tuple[str, Dict[str, Any]]:
+def _build_join_sql(
+    schema: Schema,
+    base_table: str,
+    target_table: str,
+    base_filter_sql: str,
+    base_params: Dict[str, Any],
+    select_expr: str,
+) -> Tuple[str, Dict[str, Any]]:
     path = _bfs_fk_path(schema, base_table, target_table)
     if path is None:
         raise ValueError("no_fk_path")
@@ -205,6 +231,57 @@ def _build_join_sql(schema: Schema, base_table: str, target_table: str, base_fil
     return sql, params
 
 
+def _fmt_tnd(x: Any) -> str:
+    try:
+        v = float(x or 0)
+    except Exception:
+        v = 0.0
+    return f"{v:,.0f}".replace(",", " ") + " TND"
+
+
+def _find_fonds_amount_source(schema: Schema) -> Optional[Tuple[str, str, str]]:
+    """
+    Find best table to compute amount per fonds when 'fonds' table has no amount column.
+    Returns (source_table, fonds_fk_col, amount_col)
+    """
+    # prioritize common candidates if they exist
+    priority_tables = ["financement_fonds", "souscription", "liberation", "libération"]
+    candidates = [t for t in priority_tables if t in schema.tables] + [t for t in schema.tables if t not in priority_tables]
+
+    for t in candidates:
+        cols = schema.cols.get(t, [])
+        colnames = {c for c, _typ in cols}
+
+        fonds_fk = None
+        for fk in ["fonds_id", "fond_id"]:
+            if fk in colnames:
+                fonds_fk = fk
+                break
+        if not fonds_fk:
+            continue
+
+        amount_col = None
+        # prefer montant-like numeric columns
+        montant_like = []
+        for c, typ in cols:
+            if _is_numeric_type(typ) and ("montant" in _norm(c) or "amount" in _norm(c) or "valeur" in _norm(c)):
+                montant_like.append(c)
+
+        if montant_like:
+            # choose most likely
+            for pref in ["montant", "montant_souscription", "montant_liberation", "amount", "valeur"]:
+                for c in montant_like:
+                    if pref in _norm(c):
+                        amount_col = c
+                        break
+                if amount_col:
+                    break
+            amount_col = amount_col or montant_like[0]
+            return (t, fonds_fk, amount_col)
+
+    return None
+
+
 def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]]:
     schema = load_schema()
     q = message or ""
@@ -213,18 +290,157 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
     year = _extract_year(q)
     name = _extract_name(q)
 
-    is_list = bool(RX_LIST.search(q))
     is_total = bool(RX_TOTAL.search(q))
     is_who = bool(RX_WHO_IS.search(q))
+    is_list = bool(RX_LIST.search(q))
 
     base_table = _find_table_by_keyword(schema, q)
 
+    # ✅ FIX 1: treat "montant de chaque/par fond(s)" as a list intent
+    if (not is_list) and RX_MONTANT.search(q) and RX_EACH.search(q) and ("fonds" in qn or "fond" in qn):
+        is_list = True
+        if not base_table:
+            base_table = "fonds"
+
+    # === LIST MODE ===
+    if is_list:
+        # keep your original guard
+        if name and ("fonds" in qn or "fond" in qn):
+            return None
+
+        if not base_table:
+            if "fonds" in qn or "fond" in qn:
+                base_table = "fonds"
+            elif "projet" in qn or "projects" in qn:
+                base_table = "projet"
+
+        if not base_table or base_table not in schema.tables:
+            return None
+
+        label_col = _guess_label_column(schema, base_table) or schema.pk.get(base_table)
+        if not label_col:
+            return None
+
+        table_cols = {c for c, _t in schema.cols.get(base_table, [])}
+
+        want_amounts = bool(RX_MONTANT.search(q) and RX_EACH.search(q)) or (
+            base_table == "fonds" and RX_MONTANT.search(q)
+        )
+
+        amount_col = None
+        if want_amounts:
+            for c in ["montant", "montant_souscription", "montant_liberation", "amount", "valeur"]:
+                if c in table_cols:
+                    amount_col = c
+                    break
+
+        qlow = (q or "").lower()
+        unlimited = any(w in qlow for w in ["tout", "tous", "toutes"])
+        limit = HARD_LIST_LIMIT if unlimited else DEFAULT_LIST_LIMIT
+
+        # ✅ FIX 2: if fonds has no amount column, compute per fonds from a linked table (financement_fonds / souscription / liberation ...)
+        if want_amounts and base_table == "fonds" and not amount_col:
+            src = _find_fonds_amount_source(schema)
+            if src:
+                src_table, fonds_fk, src_amount_col = src
+                fonds_pk = schema.pk.get("fonds") or "id"
+
+                with engine.begin() as conn:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT
+                                f.{label_col} AS label,
+                                COALESCE(SUM(s.{src_amount_col}), 0) AS amount
+                            FROM fonds f
+                            LEFT JOIN {src_table} s ON s.{fonds_fk} = f.{fonds_pk}
+                            GROUP BY f.{label_col}
+                            ORDER BY f.{label_col} ASC
+                            LIMIT :limit
+                        """
+                        ),
+                        {"limit": limit},
+                    ).mappings().all()
+
+                if not rows:
+                    return {
+                        "ok": True,
+                        "text": "Je ne sais pas d’après les données disponibles.",
+                        "used": {"mode": "sql:list_amounts_join", "table": "fonds", "src_table": src_table, "debug": debug},
+                    }
+
+                out = "Voici la liste :\n\n" + "\n".join(
+                    [f"{i+1}. {str(r['label'])} : {_fmt_tnd(r['amount'])}" for i, r in enumerate(rows)]
+                )
+                return {
+                    "ok": True,
+                    "text": out,
+                    "used": {
+                        "mode": "sql:list_amounts_join",
+                        "table": "fonds",
+                        "src_table": src_table,
+                        "src_amount_col": src_amount_col,
+                        "count": len(rows),
+                        "debug": debug,
+                    },
+                }
+
+        # original list amounts when amount column exists in base_table
+        with engine.begin() as conn:
+            if want_amounts and amount_col:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT {label_col} AS label, {amount_col} AS amount
+                        FROM {base_table}
+                        ORDER BY {label_col} ASC
+                        LIMIT :limit
+                    """
+                    ),
+                    {"limit": limit},
+                ).mappings().all()
+
+                if not rows:
+                    return {
+                        "ok": True,
+                        "text": "Je ne sais pas d’après les données disponibles.",
+                        "used": {"mode": "sql:list_amounts", "table": base_table, "debug": debug},
+                    }
+
+                out = "Voici la liste :\n\n" + "\n".join(
+                    [f"{i+1}. {str(r['label'])} : {_fmt_tnd(r['amount'])}" for i, r in enumerate(rows)]
+                )
+                return {
+                    "ok": True,
+                    "text": out,
+                    "used": {"mode": "sql:list_amounts", "table": base_table, "count": len(rows), "col": amount_col, "debug": debug},
+                }
+
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT {label_col} AS v
+                    FROM {base_table}
+                    ORDER BY {label_col} ASC
+                    LIMIT :limit
+                """
+                ),
+                {"limit": limit},
+            ).scalars().all()
+
+        if not rows:
+            return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:list", "table": base_table, "debug": debug}}
+
+        out = "Voici la liste :\n\n" + "\n".join([f"{i+1}. {str(v)}" for i, v in enumerate(rows)])
+        return {"ok": True, "text": out, "used": {"mode": "sql:list", "table": base_table, "count": len(rows), "debug": debug}}
+
+    # === TOTAL MODE ===
     if is_total:
         if not base_table:
             if "souscription" in qn:
                 base_table = "souscription"
-            elif "liberation" in qn or "libération" in q.lower():
-                base_table = "inv_liberation_action"
+            elif "liberation" in qn or "libération" in (q.lower()):
+                base_table = "liberation"
 
         if not base_table or base_table not in schema.tables:
             return None
@@ -235,7 +451,7 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
             return None
 
         preferred = None
-        for hint in ["montant", "total", "somme"]:
+        for hint in ["montant", "total", "somme", "amount", "valeur"]:
             for c in num_cols:
                 if hint in _norm(c):
                     preferred = c
@@ -256,23 +472,30 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
             cols_s = {c for c, _t in schema.cols.get("souscription", [])}
             if "fonds_id" in cols_s and "fonds" in schema.tables:
                 label_f = _guess_label_column(schema, "fonds") or "denomination"
-                sql = text(f"""
+                sql = text(
+                    f"""
                     SELECT COALESCE(SUM(s.{col}), 0) AS v
                     FROM souscription s
                     JOIN fonds f ON s.fonds_id = f.id
                     WHERE ({where}) AND (f.{label_f} ILIKE :fname OR COALESCE(f.alias,'') ILIKE :fname)
-                """)
+                """
+                )
                 params2 = dict(params)
                 params2["fname"] = f"%{name}%"
                 with engine.begin() as conn:
                     v = conn.execute(sql, params2).scalar_one()
-                return {"ok": True, "text": f"Le total est {float(v):,.0f}".replace(",", " ") + " TND", "used": {"mode": "sql:sum", "table": "souscription", "col": col, "year": year, "filter": "fonds", "debug": debug}}
+                return {
+                    "ok": True,
+                    "text": f"Le total est {_fmt_tnd(v)}",
+                    "used": {"mode": "sql:sum", "table": "souscription", "col": col, "year": year, "filter": "fonds", "debug": debug},
+                }
 
         with engine.begin() as conn:
             v = conn.execute(text(f"SELECT COALESCE(SUM({col}), 0) FROM {base_table} WHERE {where}"), params).scalar_one()
 
-        return {"ok": True, "text": f"Le total est {float(v):,.0f}".replace(",", " ") + " TND", "used": {"mode": "sql:sum", "table": base_table, "col": col, "year": year, "debug": debug}}
+        return {"ok": True, "text": f"Le total est {_fmt_tnd(v)}", "used": {"mode": "sql:sum", "table": base_table, "col": col, "year": year, "debug": debug}}
 
+    # === WHO/RELATION MODE ===
     if is_who and RX_OF.search(q) and name:
         entity_table = None
         if "projet" in qn:
@@ -317,7 +540,14 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
         if path is None:
             return None
 
-        sql, params = _build_join_sql(schema, entity_table, target_table, base_filter, params, f"t{len(path)}.{target_label}")
+        sql, params = _build_join_sql(
+            schema=schema,
+            base_table=entity_table,
+            target_table=target_table,
+            base_filter_sql=base_filter,
+            base_params=params,
+            select_expr=f"t{len(path)}.{target_label}",
+        )
 
         with engine.begin() as conn:
             row = conn.execute(text(sql), params).mappings().first()
@@ -326,76 +556,5 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
             return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:rel", "hit": False, "debug": debug}}
 
         return {"ok": True, "text": str(row["value"]), "used": {"mode": "sql:rel", "entity": entity_table, "attr": target_table, "debug": debug}}
-
-    if is_list:
-        if not base_table:
-            if "fonds" in qn or "fond" in qn:
-                base_table = "fonds"
-            elif "projet" in qn or "projects" in qn:
-                base_table = "projet"
-
-        if not base_table or base_table not in schema.tables:
-            return None
-
-        label_col = _guess_label_column(schema, base_table) or schema.pk.get(base_table)
-        if not label_col:
-            return None
-
-        want_amounts = bool(RX_MONTANT.search(q) and RX_EACH.search(q)) or (base_table == "fonds" and RX_MONTANT.search(q))
-
-        qlow = (q or "").lower()
-        unlimited = any(w in qlow for w in ["tout", "tous", "toutes"])
-        limit = HARD_LIST_LIMIT if unlimited else DEFAULT_LIST_LIMIT
-
-        if want_amounts and base_table == "fonds" and "souscription" in schema.tables:
-            cols_s = {c for c, _t in schema.cols.get("souscription", [])}
-            if "fonds_id" in cols_s:
-                montant_col = None
-                for c, t in schema.cols.get("souscription", []):
-                    if c in ("montant_souscription", "montant"):
-                        if _is_numeric_type(t):
-                            montant_col = c
-                            break
-                if montant_col:
-                    where = "1=1"
-                    params: Dict[str, Any] = {}
-                    if year is not None:
-                        date_col = _find_year_column(schema, "souscription")
-                        if date_col:
-                            where = f"EXTRACT(YEAR FROM s.{date_col}) = :year"
-                            params["year"] = int(year)
-
-                    with engine.begin() as conn:
-                        rows = conn.execute(text(f"""
-                            SELECT f.{label_col} AS label, COALESCE(SUM(s.{montant_col}),0) AS amount
-                            FROM fonds f
-                            LEFT JOIN souscription s ON s.fonds_id = f.id
-                            WHERE {where}
-                            GROUP BY f.{label_col}
-                            ORDER BY f.{label_col} ASC
-                            LIMIT :limit
-                        """), {**params, "limit": limit}).mappings().all()
-
-                    if not rows:
-                        return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:list_amounts", "table": "fonds", "from": "souscription", "debug": debug}}
-
-                    out = "Voici la liste :\n\n" + "\n".join(
-                        [f"{i+1}. {str(r['label'])} : {float(r['amount'] or 0):,.0f}".replace(",", " ") + " TND" for i, r in enumerate(rows)]
-                    )
-                    return {"ok": True, "text": out, "used": {"mode": "sql:list_amounts", "table": "fonds", "from": "souscription", "col": montant_col, "year": year, "count": len(rows), "debug": debug}}
-
-        with engine.begin() as conn:
-            rows = conn.execute(text(f"""
-                SELECT {label_col} AS v
-                FROM {base_table}
-                ORDER BY {label_col} ASC
-                LIMIT :limit
-            """), {"limit": limit}).scalars().all()
-
-        if not rows:
-            return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:list", "table": base_table, "debug": debug}}
-
-        out = "Voici la liste :\n\n" + "\n".join([f"{i+1}. {str(v)}" for i, v in enumerate(rows)])
-        return {"ok": True, "text": out, "used": {"mode": "sql:list", "table": base_table, "count": len(rows), "debug": debug}}
 
     return None

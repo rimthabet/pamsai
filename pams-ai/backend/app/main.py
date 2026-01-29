@@ -1,19 +1,24 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import json
 from typing import Any, Dict, List
 
-from app.chat_service import chat_pipeline
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from app.chat_service import chat_pipeline
+from rag.retrieve_core import _get_embed_model
 
 
+class UTF8JSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
 
 app = FastAPI(title="PAMS-AI Agent")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,25 +28,9 @@ app.add_middleware(
 )
 
 
-#app = FastAPI() 
-#app.add_middleware(
-   # CORSMiddleware,
-    #allow_origins=[
-    #    "http://localhost:4200",
-     #   "http://127.0.0.1:4200",
-    #],
-    #allow_credentials=True,
-    #allow_methods=["*"],
-    #allow_headers=["*"],
-##)
-
-# routes
-#@app.post("/chat")
-#def chat(payload: dict):
-   # return {
-          #"answer": "OK",
-        #"used": {"mode": "test"}
-    #}
+@app.on_event("startup")
+def warmup_models():
+    _get_embed_model()
 
 
 class ChatRequest(BaseModel):
@@ -50,7 +39,7 @@ class ChatRequest(BaseModel):
     model: str = "llama3.2"
     role: str = "viewer"
     debug: bool = False
-    mode: str = "rag"  
+    mode: str = "rag"
 
 
 class ChatResponse(BaseModel):
@@ -66,7 +55,7 @@ def health():
     return {"ok": True}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 def chat(req: ChatRequest):
     try:
         out = chat_pipeline(
@@ -77,18 +66,23 @@ def chat(req: ChatRequest):
             debug=req.debug,
             mode=req.mode,
         )
-        # stabilité JSON
+
+        
         out.setdefault("answer", "Je ne sais pas d’après les données disponibles.")
         out.setdefault("sources", [])
         out.setdefault("suggested_actions", [])
         out.setdefault("navigation", [])
         out.setdefault("used", {})
-        return out
+
+       
+        return UTF8JSONResponse(content=out)
+
     except Exception as e:
-        return {
+        err = {
             "answer": "Erreur interne côté serveur.",
             "sources": [],
             "suggested_actions": [],
             "navigation": [],
             "used": {"mode": "error", "error": repr(e), "debug": req.debug},
         }
+        return UTF8JSONResponse(content=err, status_code=500)
