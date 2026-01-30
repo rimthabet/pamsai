@@ -25,6 +25,10 @@ RX_VL = re.compile(
     re.I,
 )
 
+RX_ANALYTICS_SKIP = re.compile(
+    r"\b(p[eé]riode|dur[eé]e|date|c[' ]?est quoi|quelle est|etat|état|etats|états|financier|rapport|prospectus|r[eè]glement|annexe)\b",
+    re.I,
+)
 
 def _sources_from_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -112,14 +116,7 @@ def extract_financials_from_ocr(query: str, chunks: List[Dict[str, Any]]) -> Dic
         except Exception:
             year_wanted = None
 
-    best: Dict[str, Any] = {
-        "year": None,
-        "actif_net": None,
-        "vl": None,
-        "file": None,
-        "page": None,
-        "score": 0.0,
-    }
+    best: Dict[str, Any] = {"year": None, "actif_net": None, "vl": None, "file": None, "page": None, "score": 0.0}
 
     for ch in chunks:
         if ch.get("source_type") != "pdf_ocr":
@@ -229,7 +226,6 @@ def _format_context(chunks: List[Dict[str, Any]], max_chars: int = 4500) -> str:
             header = f"[pdf={meta.get('file','')} page={meta.get('page','')}]"
         else:
             header = f"[{st} {ch.get('source_id','')}]"
-
         txt = (ch.get("content") or "").strip()
         if not txt:
             continue
@@ -302,15 +298,16 @@ def chat_pipeline(
             "used": early.get("used") or {"mode": "analytics:rel", "debug": debug},
         }
 
-    a = run_analytics(message, debug=debug)
-    if a and a.get("ok"):
-        return {
-            "answer": a["text"],
-            "sources": [],
-            "suggested_actions": [],
-            "navigation": [],
-            "used": a.get("used") or {"mode": "analytics", "debug": debug},
-        }
+    if not RX_ANALYTICS_SKIP.search(message or ""):
+        a = run_analytics(message, debug=debug)
+        if a and a.get("ok"):
+            return {
+                "answer": a["text"],
+                "sources": [],
+                "suggested_actions": [],
+                "navigation": [],
+                "used": a.get("used") or {"mode": "analytics", "debug": debug},
+            }
 
     t0 = time.time()
     log.warning("STEP 1: try_answer_sql start")
@@ -352,9 +349,7 @@ def chat_pipeline(
                     ptxt = f" (page {fin.get('page')})" if fin.get("page") else ""
                     lines.append(f"Source: {fin['file']}{ptxt}")
                 lines.append("")
-
             answer = ("\n".join(lines) + "\n" if lines else "") + doc_text
-
             return {
                 "answer": answer,
                 "sources": sources,

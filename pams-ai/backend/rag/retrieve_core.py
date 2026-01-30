@@ -1,8 +1,8 @@
-# rag/retrieve_core.py
 from __future__ import annotations
 
 import os, re, json
 from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
 
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import text
@@ -11,8 +11,6 @@ from app.db import engine
 from pgvector.psycopg2 import register_vector
 
 MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
-
-# Cache global du modèle embedding (perf)
 _EMBED_MODEL: Optional[SentenceTransformer] = None
 
 
@@ -30,9 +28,6 @@ def _get_dbapi_conn(conn):
         return conn.connection.connection
 
 
-# -----------------------------
-# Document-title heuristics (OCR)
-# -----------------------------
 RX_DOC_TITLE = re.compile(
     r"\b("
     r"situation\s+annuelle|"
@@ -55,30 +50,19 @@ RX_FONDS_WORDS = re.compile(r"\b(fonds|fcpr|fcp|sicav)\b", re.I)
 
 
 def _looks_like_document_title(q: str) -> bool:
-    """
-    Heuristique: détecte les requêtes qui ressemblent à un titre de PDF OCR
-    même si le mot "rapport" n'est pas présent.
-    """
     q = (q or "").strip()
     if not q or len(q) < 8:
         return False
-
     if RX_DOC_TITLE.search(q):
         return True
-
-    # Si beaucoup de MAJUSCULES + mention fonds/fcp/fcpr => souvent un titre OCR
     letters = [c for c in q if c.isalpha()]
     if len(letters) >= 12:
         upper_ratio = sum(c.isupper() for c in letters) / max(1, len(letters))
         if upper_ratio >= 0.55 and RX_FONDS_WORDS.search(q):
             return True
-
     return False
 
 
-# -----------------------------
-# Domain detection
-# -----------------------------
 INTENT_RULES: List[Tuple[str, int, re.Pattern]] = [
     ("document", 100, re.compile(
         r"\b(commission|commissions|prospectus|note|r[eè]glement|rapport|annexe|risque|risques|pv|proc[eè]s[-\s]?verbal|document)\b",
@@ -114,11 +98,8 @@ DOMAIN_TO_SOURCE_TYPES: Dict[str, List[str]] = {
 
 def detect_domain(query: str) -> str:
     q = query or ""
-
-    # ✅ boost doc detection for OCR titles
     if _looks_like_document_title(q):
         return "document"
-
     hits: List[Tuple[int, str]] = []
     for domain, prio, rx in INTENT_RULES:
         if rx.search(q):
@@ -134,13 +115,7 @@ def scope_for_domain(domain: str) -> List[str]:
 
 
 def auto_source_types(query: str) -> List[str]:
-    """
-    Déduit un scope (liste de source_types) depuis la requête.
-    Peut retourner multi-scope (ex: document+fonds).
-    """
     q = query or ""
-
-    # ✅ If it looks like a document title, always include pdf_ocr
     looks_doc = _looks_like_document_title(q)
 
     hits: List[Tuple[int, str]] = []
@@ -149,7 +124,6 @@ def auto_source_types(query: str) -> List[str]:
             hits.append((prio, domain))
 
     if not hits:
-        # if no keyword hit but looks like doc => search in docs
         if looks_doc:
             return ["pdf_ocr", "maxula:document"]
         return []
@@ -161,7 +135,6 @@ def auto_source_types(query: str) -> List[str]:
     if re.search(r"\bfrais\b", q, re.I) and re.search(r"\bcommission", q, re.I):
         top_domains = ["document", "fonds"]
 
-    # ✅ If query looks like doc but domain is fonds, add document too
     if looks_doc and "document" not in top_domains:
         top_domains = ["document"] + top_domains
 
@@ -176,9 +149,6 @@ def auto_source_types(query: str) -> List[str]:
     return out
 
 
-# -----------------------------
-# Entity hint extraction
-# -----------------------------
 def extract_entity_hint(query: str) -> str:
     q = (query or "").strip()
     m = re.search(r'"([^"]{3,})"', q)
@@ -190,9 +160,6 @@ def extract_entity_hint(query: str) -> str:
     return ""
 
 
-# -----------------------------
-# Keyword retrieval
-# -----------------------------
 def keyword_lookup(entity_hint: str, source_types: List[str], limit: int = 5) -> List[Dict[str, Any]]:
     hint = (entity_hint or "").strip()
     if not hint or len(hint) < 3:
@@ -234,12 +201,15 @@ def keyword_lookup(entity_hint: str, source_types: List[str], limit: int = 5) ->
     return out
 
 
-# ----------------------------
-# Semantic retrieval (pgvector)
-# -----------------------------
-def semantic_retrieve(query: str, top_k: int = 10, source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+@lru_cache(maxsize=512)
+def _cached_query_vec(query: str) -> Tuple[float, ...]:
     model = _get_embed_model()
-    qvec = model.encode([query], normalize_embeddings=True)[0].tolist()
+    v = model.encode([query], normalize_embeddings=True)[0].tolist()
+    return tuple(float(x) for x in v)
+
+
+def semantic_retrieve(query: str, top_k: int = 10, source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    qvec = list(_cached_query_vec(query))
 
     where = []
     params: Dict[str, Any] = {"qvec": qvec, "k": top_k}
@@ -292,23 +262,13 @@ def _merge_dedupe(rows: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]
     return sorted(best.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)[:top_k]
 
 
-# -----------------------------
-# Hybrid retrieve
-# -----------------------------
 def hybrid_retrieve(
     query: str,
     top_k: int = 10,
     source_types: Optional[List[str]] = None,
     entity_hint: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:
-    """
-    Hybrid:
-    - scope auto si source_types non fourni
-    - keyword boost si entity_hint trouvé
-    - semantic retrieve
-    - merge + dedupe + tri score desc
-    - ✅ fallback pdf_ocr si la requête ressemble à un titre OCR mais scope initial n'inclut pas pdf_ocr
-    """
+
     domain = detect_domain(query)
     auto_scope = auto_source_types(query)
     scope = source_types if source_types is not None else auto_scope
@@ -318,29 +278,23 @@ def hybrid_retrieve(
 
     hint = (entity_hint or "").strip() or extract_entity_hint(query)
 
-    # Pass 1
     kw = keyword_lookup(hint, scope, limit=min(5, top_k)) if hint else []
     sem = semantic_retrieve(query, top_k=top_k, source_types=scope if scope else None)
 
     merged = _merge_dedupe(kw + sem, top_k=top_k)
 
-    # ✅ Pass 2: fallback pdf_ocr for doc-like queries
     best_score = float(merged[0]["score"]) if merged else 0.0
     looks_doc = _looks_like_document_title(query)
-
     has_pdf = any(r.get("source_type") == "pdf_ocr" for r in merged)
+
     if looks_doc and (not has_pdf):
         pdf_scope = ["pdf_ocr"]
         sem2 = semantic_retrieve(query, top_k=top_k, source_types=pdf_scope)
-        merged2 = _merge_dedupe(sem2 + merged, top_k=top_k)
-        merged = merged2
-
-        # expand scope info
+        merged = _merge_dedupe(sem2 + merged, top_k=top_k)
         for s in pdf_scope:
             if s not in scope:
                 scope.append(s)
 
-    # fallback global if very weak (optional but useful)
     if looks_doc and best_score < 0.50:
         pdf_scope = ["pdf_ocr"]
         sem2 = semantic_retrieve(query, top_k=top_k, source_types=pdf_scope)
