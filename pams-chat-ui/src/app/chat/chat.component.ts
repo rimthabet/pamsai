@@ -1,31 +1,47 @@
 import { Component } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-
+import { FormsModule } from '@angular/forms';
 @Component({
   selector: 'app-chat',
-  standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [FormsModule],
   templateUrl: './chat.component.html',
+  styleUrls: ['./chat.component.css']
 })
 export class ChatComponent {
-  message = '';
-  messages: { role: 'user' | 'bot'; text: string }[] = [];
+
+  input: string = '';
+  loading: boolean = false;
+
+  messages: { role: 'user' | 'assistant', text: string }[] = [];
 
   constructor(private http: HttpClient) {}
 
   send() {
-    if (!this.message.trim()) return;
+    if (!this.input.trim() || this.loading) return;
 
-    const userMsg = this.message;
-    this.messages.push({ role: 'user', text: userMsg });
-    this.message = '';
+    const userMessage = this.input;
 
-    this.http.post<any>('http://127.0.0.1:8001/chat', {
-      message: userMsg
-    }).subscribe(res => {
-      this.messages.push({ role: 'bot', text: res.answer });
-    });
+    
+    this.messages.push({ role: 'user', text: userMessage });
+    this.input = '';
+    this.loading = true;
+
+    this.http.post<any>('/api/chat', { message: userMessage })
+      .subscribe({
+        next: (res) => {
+          this.messages.push({
+            role: 'assistant',
+            text: res.answer ?? 'Aucune réponse'
+          });
+          this.loading = false;
+        },
+        error: () => {
+          this.messages.push({
+            role: 'assistant',
+            text: 'Erreur API'
+          });
+          this.loading = false;
+        }
+      });
   }
 }

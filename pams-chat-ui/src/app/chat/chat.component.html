@@ -1,12 +1,9 @@
-<div class="chat">
-  <div *ngFor="let m of messages" [class.user]="m.role === 'user'" class="msg">
-    {{ m.text }}
-  </div>
+<input
+  type="text"
+  [(ngModel)]="input"
+  (keydown.enter)="send()"
+/>
 
-  <input
-    [(ngModel)]="message"
-    (keyup.enter)="send()"
-    placeholder="Pose ta question..."
-  />
-  <button (click)="send()">Envoyer</button>
-</div>
+<button type="button" (click)="send()" [disabled]="loading || !input.trim()">
+  Envoyer
+</button>

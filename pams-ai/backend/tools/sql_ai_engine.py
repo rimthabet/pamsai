@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
+
 from sqlalchemy import text
 from app.db import engine
 
@@ -15,6 +16,9 @@ RX_REPARTITION = re.compile(r"\b(r[eé]partition|repartition|distribution)\b", r
 RX_BY_STATE = re.compile(r"\b(par\s+(?:[eé]tat|etat|statut|status))\b", re.I)
 RX_BY_YEAR = re.compile(r"\b(par\s+(?:ann[eé]e|annee|an))\b", re.I)
 RX_STATUT = re.compile(r"\b(statut|[eé]tat|etat|avancement)\b", re.I)
+
+RX_PROJET = re.compile(r"\b(projet|projets|project|projects)\b", re.I)
+RX_FONDS = re.compile(r"\b(fonds?|fond)\b", re.I)
 
 RX_WHO_IS = re.compile(r"\b(qui\s+est|c'?est\s+qui)\b", re.I)
 RX_OF = re.compile(r"\b(du|de\s+la|de\s+l')\b", re.I)
@@ -74,43 +78,59 @@ def load_schema(force: bool = False) -> Schema:
         return _SCHEMA_CACHE
 
     with engine.begin() as conn:
-        tables = conn.execute(text("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_type='BASE TABLE'
-        """)).scalars().all()
+        tables = conn.execute(
+            text(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type='BASE TABLE'
+                """
+            )
+        ).scalars().all()
 
-        cols_rows = conn.execute(text("""
-            SELECT table_name, column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-            ORDER BY table_name, ordinal_position
-        """)).mappings().all()
+        cols_rows = conn.execute(
+            text(
+                """
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position
+                """
+            )
+        ).mappings().all()
 
-        pk_rows = conn.execute(text("""
-            SELECT tc.table_name, kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-            WHERE tc.table_schema='public' AND tc.constraint_type='PRIMARY KEY'
-        """)).mappings().all()
+        pk_rows = conn.execute(
+            text(
+                """
+                SELECT tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema='public' AND tc.constraint_type='PRIMARY KEY'
+                """
+            )
+        ).mappings().all()
 
-        fk_rows = conn.execute(text("""
-            SELECT
-              tc.table_name AS src_table,
-              kcu.column_name AS src_col,
-              ccu.table_name AS dst_table,
-              ccu.column_name AS dst_col
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON ccu.constraint_name = tc.constraint_name
-             AND ccu.table_schema = tc.table_schema
-            WHERE tc.table_schema='public' AND tc.constraint_type='FOREIGN KEY'
-        """)).mappings().all()
+        fk_rows = conn.execute(
+            text(
+                """
+                SELECT
+                  tc.table_name AS src_table,
+                  kcu.column_name AS src_col,
+                  ccu.table_name AS dst_table,
+                  ccu.column_name AS dst_col
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage ccu
+                  ON ccu.constraint_name = tc.constraint_name
+                 AND ccu.table_schema = tc.table_schema
+                WHERE tc.table_schema='public' AND tc.constraint_type='FOREIGN KEY'
+                """
+            )
+        ).mappings().all()
 
     cols: Dict[str, List[Tuple[str, str]]] = {}
     for r in cols_rows:
@@ -158,49 +178,12 @@ def _find_year_column(schema: Schema, table: str) -> Optional[str]:
     return None
 
 
-def _pick_amount_column(schema: Schema, table: str) -> Optional[str]:
-    table_cols = {c for c, _t in schema.cols.get(table, [])}
-    for c in ["montant", "total", "montant_souscription", "montant_liberation"]:
-        if c in table_cols:
-            return c
-    return None
-
-
-def _find_fk(schema: Schema, src_table: str, dst_table: str) -> Optional[FKEdge]:
-    for e in schema.fks:
-        if e.src_table == src_table and e.dst_table == dst_table:
-            return e
-    return None
-
-
-def _resolve_join_group(
-    schema: Schema,
-    base_table: str,
-    state_table: str,
-    base_alias: str,
-    state_alias: str,
-    fallback_fk_cols: List[str],
-) -> Optional[Tuple[str, str]]:
-    if base_table not in schema.tables or state_table not in schema.tables:
+def _safe_query(sql: Any, params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    try:
+        with engine.begin() as conn:
+            return conn.execute(sql, params).mappings().all()
+    except Exception:
         return None
-
-    fk = _find_fk(schema, base_table, state_table)
-    if fk:
-        join_sql = f"LEFT JOIN {state_table} {state_alias} ON {base_alias}.{fk.src_col} = {state_alias}.{fk.dst_col}"
-    else:
-        base_cols = {c for c, _t in schema.cols.get(base_table, [])}
-        dst_pk = schema.pk.get(state_table) or "id"
-        fk_col = next((c for c in fallback_fk_cols if c in base_cols), None)
-        if not fk_col:
-            return None
-        join_sql = f"LEFT JOIN {state_table} {state_alias} ON {base_alias}.{fk_col} = {state_alias}.{dst_pk}"
-
-    label = _guess_label_column(schema, state_table) or schema.pk.get(state_table)
-    if not label:
-        return None
-
-    group_expr = f"COALESCE({state_alias}.{label}::text, 'N/A')"
-    return join_sql, group_expr
 
 
 def _fmt_year(v: Any) -> str:
@@ -211,12 +194,21 @@ def _fmt_year(v: Any) -> str:
     return "N/A" if iv == -1 else str(iv)
 
 
-def _safe_query(sql: Any, params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    try:
-        with engine.begin() as conn:
-            return conn.execute(sql, params).mappings().all()
-    except Exception:
-        return None
+def _na(mode: str, used: Dict[str, Any]) -> Dict[str, Any]:
+    used2 = dict(used)
+    used2.setdefault("mode", mode)
+    return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": used2}
+
+
+def _pick_amount_col(schema: Schema, table: str) -> Optional[str]:
+    cols = {c for c, _t in schema.cols.get(table, [])}
+    for c in ["montant", "montant_souscription", "montant_liberation", "total"]:
+        if c in cols:
+            return c
+    for c, t in schema.cols.get(table, []):
+        if _is_numeric_type(t) and "montant" in _norm(c):
+            return c
+    return None
 
 
 def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]]:
@@ -230,193 +222,185 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
     is_list = bool(RX_LIST.search(q))
     is_total = bool(RX_TOTAL.search(q))
     is_count = bool(RX_COUNT.search(q))
-    is_repartition = bool(RX_REPARTITION.search(q)) and (RX_BY_STATE.search(q) or RX_STATUT.search(q))
-    by_year = bool(RX_BY_YEAR.search(q))
 
-    base_table = _find_table_by_keyword(schema, q)
-
-    if is_repartition:
-        if not base_table:
-            if "projet" in qn or "projects" in qn:
-                base_table = "projet"
-            elif "fonds" in qn or "fond" in qn:
-                base_table = "fonds"
-            elif "souscription" in qn:
-                base_table = "souscription"
-            elif "liberation" in qn or "libération" in q.lower():
-                base_table = "liberation"
-
-        if not base_table or base_table not in schema.tables:
+    wants_amounts_each_fund = bool(RX_MONTANT.search(q) and RX_FONDS.search(q) and (RX_EACH.search(q) or "chaque" in q.lower()))
+    
+    if wants_amounts_each_fund:
+        if "fonds" not in schema.tables:
             return None
+
+        label_col = _guess_label_column(schema, "fonds") or schema.pk.get("fonds") or "id"
+        amount_col = _pick_amount_col(schema, "fonds")
+
+        if amount_col:
+            sql = text(f"""
+                SELECT f.{label_col} AS label, COALESCE(f.{amount_col}, 0) AS amount
+                FROM fonds f
+                ORDER BY f.{label_col} ASC
+            """)
+            rows = _safe_query(sql, {})
+            if not rows:
+                return _na("sql:list_amounts", {"table": "fonds", "col": amount_col, "debug": debug})
+
+            out = "Voici le montant de chaque fonds :\n\n" + "\n".join(
+                [f"{i+1}. {str(r['label'])} : {float(r['amount'] or 0):,.0f}".replace(",", " ") + " TND" for i, r in enumerate(rows)]
+            )
+            return {"ok": True, "text": out, "used": {"mode": "sql:list_amounts", "table": "fonds", "count": len(rows), "col": amount_col, "debug": debug}}
+
+        if "financement_fonds" in schema.tables:
+            cols_ff = {c for c, _t in schema.cols.get("financement_fonds", [])}
+            if "fonds_id" in cols_ff:
+                ff_amount = _pick_amount_col(schema, "financement_fonds")
+                if ff_amount:
+                    sql = text(f"""
+                        SELECT f.{label_col} AS label, COALESCE(SUM(ff.{ff_amount}), 0) AS amount
+                        FROM financement_fonds ff
+                        JOIN fonds f ON ff.fonds_id = f.id
+                        GROUP BY f.{label_col}
+                        ORDER BY f.{label_col} ASC
+                    """)
+                    rows = _safe_query(sql, {})
+                    if rows:
+                        out = "Voici le montant de chaque fonds :\n\n" + "\n".join(
+                            [f"{i+1}. {str(r['label'])} : {float(r['amount'] or 0):,.0f}".replace(",", " ") + " TND" for i, r in enumerate(rows)]
+                        )
+                        return {"ok": True, "text": out, "used": {"mode": "sql:list_amounts", "table": "financement_fonds", "count": len(rows), "col": ff_amount, "debug": debug}}
+
+        return _na("sql:list_amounts", {"table": "fonds", "debug": debug})
+
+    # --- Répartition PROJET 
+    is_repartition_projet = bool(RX_REPARTITION.search(q)) and bool(RX_PROJET.search(q))
+    by_year = bool(RX_BY_YEAR.search(q)) or bool(re.search(r"\bann[eé]e\b", q, re.I))
+    by_state = bool(RX_BY_STATE.search(q) or RX_STATUT.search(q))
+
+    if is_repartition_projet:
+        if "projet" not in schema.tables:
+            return None
+
+        cols_p = {c for c, _t in schema.cols.get("projet", [])}
+        if "date_lancement" not in cols_p:
+            return _na("sql:repartition", {"table": "projet", "debug": debug})
 
         params: Dict[str, Any] = {}
         where = "1=1"
+        if year is not None:
+            where = "EXTRACT(YEAR FROM p.date_lancement) = :year"
+            params["year"] = int(year)
 
-        if base_table == "projet":
-            resolved = _resolve_join_group(
-                schema=schema,
-                base_table="projet",
-                state_table="etat_avancement",
-                base_alias="p",
-                state_alias="ea",
-                fallback_fk_cols=["etat_id", "ett_id"],
-            )
-            if not resolved:
-                return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:group", "table": "projet", "debug": debug}}
+        year_expr = "COALESCE(EXTRACT(YEAR FROM p.date_lancement)::int, -1)"
 
-            join_sql, statut_expr = resolved
-            amount_col = _pick_amount_column(schema, "projet")
+        cols_ea = {c for c, _t in schema.cols.get("etat_avancement", [])} if "etat_avancement" in schema.tables else set()
+        has_etat_join = ("etat_id" in cols_p) and ("etat_avancement" in schema.tables) and ("libelle" in cols_ea)
 
-            date_col = _find_year_column(schema, "projet")
-            if by_year and not date_col:
-                return {
-                    "ok": True,
-                    "text": "Impossible de calculer 'par année' : aucune colonne date détectée dans la table projet.",
-                    "used": {"mode": "sql:group", "table": "projet", "group": "etat_avancement", "year": year, "debug": debug},
-                }
+        if by_state and not has_etat_join:
+            return _na("sql:repartition", {"table": "projet", "by": "etat", "hit": False, "debug": debug})
 
-            year_expr = f"EXTRACT(YEAR FROM p.{date_col})::int" if date_col else None
-            year_expr_safe = f"COALESCE({year_expr}, -1)" if year_expr else None
+        join_sql = "LEFT JOIN etat_avancement ea ON p.etat_id = ea.id" if has_etat_join else ""
+        statut_expr = "COALESCE(ea.libelle::text, 'N/A')" if has_etat_join else None
 
-            if year is not None and date_col:
-                where = f"EXTRACT(YEAR FROM p.{date_col}) = :year"
-                params["year"] = int(year)
-
-            if by_year and year_expr_safe:
-                if amount_col:
-                    sql = text(f"""
-                        SELECT {year_expr_safe} AS annee,
-                               {statut_expr} AS statut,
-                               COUNT(*)::bigint AS n,
-                               COALESCE(SUM(p.{amount_col}), 0) AS s
-                        FROM projet p
-                        {join_sql}
-                        WHERE {where}
-                        GROUP BY {year_expr_safe}, {statut_expr}
-                        ORDER BY {year_expr_safe}, {statut_expr}
-                    """)
-                else:
-                    sql = text(f"""
-                        SELECT {year_expr_safe} AS annee,
-                               {statut_expr} AS statut,
-                               COUNT(*)::bigint AS n
-                        FROM projet p
-                        {join_sql}
-                        WHERE {where}
-                        GROUP BY {year_expr_safe}, {statut_expr}
-                        ORDER BY {year_expr_safe}, {statut_expr}
-                    """)
-            else:
-                if amount_col:
-                    sql = text(f"""
-                        SELECT {statut_expr} AS statut,
-                               COUNT(*)::bigint AS n,
-                               COALESCE(SUM(p.{amount_col}), 0) AS s
-                        FROM projet p
-                        {join_sql}
-                        WHERE {where}
-                        GROUP BY {statut_expr}
-                        ORDER BY {statut_expr}
-                    """)
-                else:
-                    sql = text(f"""
-                        SELECT {statut_expr} AS statut,
-                               COUNT(*)::bigint AS n
-                        FROM projet p
-                        {join_sql}
-                        WHERE {where}
-                        GROUP BY {statut_expr}
-                        ORDER BY {statut_expr}
-                    """)
-
+        if by_year and by_state:
+            sql = text(f"""
+                SELECT
+                    {year_expr} AS annee,
+                    {statut_expr} AS statut,
+                    COUNT(*)::bigint AS n
+                FROM projet p
+                {join_sql}
+                WHERE p.date_lancement IS NOT NULL AND ({where})
+                GROUP BY {year_expr}, {statut_expr}
+                ORDER BY {year_expr} ASC, {statut_expr} ASC
+            """)
             rows = _safe_query(sql, params)
             if not rows:
-                return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:group", "table": "projet", "debug": debug}}
+                return _na("sql:repartition", {"table": "projet", "by": "annee+etat", "year": year, "debug": debug})
 
-            lines: List[str] = []
-            if by_year and year_expr_safe:
-                lines.append("Répartition des projets par année et statut :\n")
-                if amount_col:
-                    for r in rows:
-                        lines.append(
-                            f"- {_fmt_year(r.get('annee'))} | {r.get('statut')} : {int(r['n'])} "
-                            f"(montant: {float(r['s']):,.0f}".replace(",", " ") + " TND)"
-                        )
-                else:
-                    for r in rows:
-                        lines.append(f"- {_fmt_year(r.get('annee'))} | {r.get('statut')} : {int(r['n'])}")
-            else:
-                lines.append("Répartition des projets par statut :\n")
-                if amount_col:
-                    for r in rows:
-                        lines.append(
-                            f"- {r.get('statut')} : {int(r['n'])} "
-                            f"(montant: {float(r['s']):,.0f}".replace(",", " ") + " TND)"
-                        )
-                else:
-                    for r in rows:
-                        lines.append(f"- {r.get('statut')} : {int(r['n'])}")
+            lines = ["Répartition des projets par année et état :\n"]
+            for r in rows:
+                lines.append(f"- {_fmt_year(r.get('annee'))} | {r.get('statut')} : {int(r['n'])}")
+            return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:repartition", "table": "projet", "by": "annee+etat", "year": year, "debug": debug}}
 
-            return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:group", "table": "projet", "group": "etat_avancement", "year": year, "debug": debug}}
+        if by_year and not by_state:
+            sql = text(f"""
+                SELECT
+                    {year_expr} AS annee,
+                    COUNT(*)::bigint AS n
+                FROM projet p
+                WHERE p.date_lancement IS NOT NULL AND ({where})
+                GROUP BY {year_expr}
+                ORDER BY {year_expr} ASC
+            """)
+            rows = _safe_query(sql, params)
+            if not rows:
+                return _na("sql:repartition", {"table": "projet", "by": "annee", "year": year, "debug": debug})
 
-        if base_table == "fonds":
-            resolved = _resolve_join_group(
-                schema=schema,
-                base_table="fonds",
-                state_table="etat_fonds",
-                base_alias="f",
-                state_alias="ef",
-                fallback_fk_cols=["etat_id", "etat_fonds_id"],
-            )
-            if not resolved:
-                return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:group", "table": "fonds", "debug": debug}}
+            lines = ["Répartition des projets par année :\n"]
+            for r in rows:
+                lines.append(f"- {_fmt_year(r.get('annee'))} : {int(r['n'])}")
+            return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:repartition", "table": "projet", "by": "annee", "year": year, "debug": debug}}
 
-            join_sql, etat_expr = resolved
-            amount_col = _pick_amount_column(schema, "fonds")
-
-            if amount_col:
-                sql = text(f"""
-                    SELECT {etat_expr} AS etat,
-                           COUNT(*)::bigint AS n,
-                           COALESCE(SUM(f.{amount_col}), 0) AS s
-                    FROM fonds f
-                    {join_sql}
-                    WHERE 1=1
-                    GROUP BY {etat_expr}
-                    ORDER BY {etat_expr}
-                """)
-            else:
-                sql = text(f"""
-                    SELECT {etat_expr} AS etat,
-                           COUNT(*)::bigint AS n
-                    FROM fonds f
-                    {join_sql}
-                    WHERE 1=1
-                    GROUP BY {etat_expr}
-                    ORDER BY {etat_expr}
-                """)
-
+        if by_state and not by_year:
+            sql = text(f"""
+                SELECT
+                    {statut_expr} AS statut,
+                    COUNT(*)::bigint AS n
+                FROM projet p
+                {join_sql}
+                GROUP BY {statut_expr}
+                ORDER BY n DESC, {statut_expr} ASC
+            """)
             rows = _safe_query(sql, {})
             if not rows:
-                return {"ok": True, "text": "Je ne sais pas d’après les données disponibles.", "used": {"mode": "sql:group", "table": "fonds", "debug": debug}}
+                return _na("sql:repartition", {"table": "projet", "by": "etat", "debug": debug})
 
-            lines: List[str] = []
-            lines.append("Répartition des fonds par état :\n")
-            if amount_col:
-                for r in rows:
-                    lines.append(f"- {r.get('etat')} : {int(r['n'])} (montant: {float(r['s']):,.0f}".replace(",", " ") + " TND)")
-            else:
-                for r in rows:
-                    lines.append(f"- {r.get('etat')} : {int(r['n'])}")
-
-            return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:group", "table": "fonds", "group": "etat_fonds", "debug": debug}}
+            lines = ["Répartition des projets par état :\n"]
+            for r in rows:
+                lines.append(f"- {r.get('statut')} : {int(r['n'])}")
+            return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:repartition", "table": "projet", "by": "etat", "debug": debug}}
 
         return None
 
+    # --------- Répartition des fonds par état
+    is_repartition_fonds = bool(RX_REPARTITION.search(q)) and bool(RX_FONDS.search(q)) and bool(RX_BY_STATE.search(q) or RX_STATUT.search(q))
+    if is_repartition_fonds:
+        if "fonds" not in schema.tables:
+            return None
+
+        cols_f = {c for c, _t in schema.cols.get("fonds", [])}
+        if "etat_id" not in cols_f:
+            return _na("sql:repartition", {"table": "fonds", "by": "etat", "debug": debug})
+
+        if "etat_fonds" not in schema.tables:
+            return _na("sql:repartition", {"table": "fonds", "by": "etat", "debug": debug})
+
+        label_state = _guess_label_column(schema, "etat_fonds") or "id"
+        label_fonds = _guess_label_column(schema, "fonds") or "id"
+
+        sql = text(f"""
+            SELECT
+                COALESCE(ef.{label_state}::text, 'N/A') AS etat,
+                COUNT(*)::bigint AS n
+            FROM fonds f
+            LEFT JOIN etat_fonds ef ON f.etat_id = ef.id
+            GROUP BY COALESCE(ef.{label_state}::text, 'N/A')
+            ORDER BY n DESC, etat ASC
+        """)
+        rows = _safe_query(sql, {})
+        if not rows:
+            return _na("sql:repartition", {"table": "fonds", "by": "etat", "debug": debug})
+
+        lines = ["Répartition des fonds par état :\n"]
+        for r in rows:
+            lines.append(f"- {r.get('etat')} : {int(r['n'])}")
+        return {"ok": True, "text": "\n".join(lines), "used": {"mode": "sql:repartition", "table": "fonds", "by": "etat", "debug": debug}}
+
+    # --------------------------
+    # LIST 
+    # --------------------------
     if is_list:
         if name and ("fonds" in qn or "fond" in qn):
             return None
 
+        base_table = _find_table_by_keyword(schema, q)
         if not base_table:
             if "fonds" in qn or "fond" in qn:
                 base_table = "fonds"
@@ -482,7 +466,11 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
         out = "Voici la liste :\n\n" + "\n".join([f"{i+1}. {str(v)}" for i, v in enumerate(rows)])
         return {"ok": True, "text": out, "used": {"mode": "sql:list", "table": base_table, "count": len(rows), "debug": debug}}
 
+    # --------------------------
+    # COUNT 
+    # --------------------------
     if is_count:
+        base_table = _find_table_by_keyword(schema, q)
         if not base_table:
             if "souscription" in qn:
                 base_table = "souscription"
@@ -512,7 +500,11 @@ def try_answer_sql(message: str, debug: bool = False) -> Optional[Dict[str, Any]
 
         return {"ok": True, "text": f"Le nombre est {int(n)}.", "used": {"mode": "sql:count", "table": base_table, "year": year, "debug": debug}}
 
+    # --------------------------
+    # TOTAL 
+    # --------------------------
     if is_total:
+        base_table = _find_table_by_keyword(schema, q)
         if not base_table:
             if "souscription" in qn:
                 base_table = "souscription"

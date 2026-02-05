@@ -47,6 +47,13 @@ RX_DOC_TITLE = re.compile(
 )
 
 RX_FONDS_WORDS = re.compile(r"\b(fonds|fcpr|fcp|sicav)\b", re.I)
+RX_YEAR = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+# extraire un nom de fonds 
+RX_FONDS_NAME = re.compile(
+    r"\b((?:FCPR|FCP|SICAV)\s+[A-Z0-9][A-Z0-9\s\-\._]{4,})\b",
+    re.I
+)
 
 
 def _looks_like_document_title(q: str) -> bool:
@@ -160,6 +167,20 @@ def extract_entity_hint(query: str) -> str:
     return ""
 
 
+def _extract_year(query: str) -> Optional[int]:
+    m = RX_YEAR.search(query or "")
+    return int(m.group(1)) if m else None
+
+
+def _extract_fonds_name(query: str) -> str:
+    q = (query or "").strip()
+    m = RX_FONDS_NAME.search(q)
+    if m:
+        # normaliser espaces
+        return re.sub(r"\s{2,}", " ", m.group(1).strip())
+    return ""
+
+
 def keyword_lookup(entity_hint: str, source_types: List[str], limit: int = 5) -> List[Dict[str, Any]]:
     hint = (entity_hint or "").strip()
     if not hint or len(hint) < 3:
@@ -208,7 +229,13 @@ def _cached_query_vec(query: str) -> Tuple[float, ...]:
     return tuple(float(x) for x in v)
 
 
-def semantic_retrieve(query: str, top_k: int = 10, source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def semantic_retrieve(
+    query: str,
+    top_k: int = 10,
+    source_types: Optional[List[str]] = None,
+    extra_where: Optional[List[str]] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     qvec = list(_cached_query_vec(query))
 
     where = []
@@ -217,6 +244,11 @@ def semantic_retrieve(query: str, top_k: int = 10, source_types: Optional[List[s
     if source_types:
         where.append("source_type = ANY(:sts)")
         params["sts"] = source_types
+
+    if extra_where:
+        where.extend(extra_where)
+    if extra_params:
+        params.update(extra_params)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
@@ -262,6 +294,65 @@ def _merge_dedupe(rows: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]
     return sorted(best.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)[:top_k]
 
 
+def _lexical_rerank(rows: List[Dict[str, Any]], query: str, domain: str) -> List[Dict[str, Any]]:
+    """
+    Rerank léger (sans nouveau modèle) : boost si le chunk contient l'année / le nom du fonds / mots-clés.
+    Très efficace sur OCR.
+    """
+    q = (query or "")
+    qlow = q.lower()
+    year = _extract_year(q)
+    fonds = _extract_fonds_name(q)
+    fonds_low = fonds.lower() if fonds else ""
+
+    key_terms = ["actif net", "valeur liquidative", "bilan", "31/12", "arrete", "arrêté", "etats financiers", "états financiers"]
+
+    def bonus(ch: Dict[str, Any]) -> float:
+        b = 0.0
+        content = (ch.get("content") or "")
+        source_id = (ch.get("source_id") or "")
+        txt = (content + " " + source_id).lower()
+
+        
+        if year:
+            if str(year) in txt:
+                b += 0.10
+            if f"31/12/{year}" in txt or f"31-12-{year}" in txt:
+                b += 0.12
+
+        if fonds_low and len(fonds_low) >= 6:
+            if fonds_low in txt:
+                b += 0.18
+            else:
+                
+                parts = [p for p in re.split(r"\s+", fonds_low) if len(p) >= 4]
+                hit = sum(1 for p in parts[:4] if p in txt)
+                if hit >= 2:
+                    b += 0.10
+
+        
+        hits = sum(1 for t in key_terms if t in txt)
+        b += min(0.12, hits * 0.03)
+
+        
+        if domain == "document":
+            if ch.get("source_type") == "pdf_ocr":
+                b += 0.04
+
+        return b
+
+    rescored = []
+    for ch in rows:
+        s = float(ch.get("score", 0.0))
+        s2 = s + bonus(ch)
+        ch2 = dict(ch)
+        ch2["score"] = float(s2)
+        rescored.append(ch2)
+
+    rescored.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return rescored
+
+
 def hybrid_retrieve(
     query: str,
     top_k: int = 10,
@@ -272,33 +363,74 @@ def hybrid_retrieve(
     domain = detect_domain(query)
     auto_scope = auto_source_types(query)
     scope = source_types if source_types is not None else auto_scope
-
     if scope is None:
         scope = []
 
     hint = (entity_hint or "").strip() or extract_entity_hint(query)
 
+  
     kw = keyword_lookup(hint, scope, limit=min(5, top_k)) if hint else []
-    sem = semantic_retrieve(query, top_k=top_k, source_types=scope if scope else None)
 
-    merged = _merge_dedupe(kw + sem, top_k=top_k)
+   
+    pool_k = max(30, top_k * 6)
+
+  
+    extra_where: List[str] = []
+    extra_params: Dict[str, Any] = {}
+
+    if domain == "document":
+        year = _extract_year(query)
+        fonds = _extract_fonds_name(query)
+
+       
+        if year:
+            extra_where.append("(source_id ILIKE :y1 OR source_id ILIKE :y2 OR content ILIKE :y3)")
+            extra_params["y1"] = f"%{year}%"
+            extra_params["y2"] = f"%31/12/{year}%"
+            extra_params["y3"] = f"%{year}%"
+
+        
+        if fonds and len(fonds) >= 6:
+            extra_where.append("content ILIKE :fonds")
+            extra_params["fonds"] = f"%{fonds}%"
+
+    sem = semantic_retrieve(
+        query,
+        top_k=pool_k,
+        source_types=scope if scope else None,
+        extra_where=extra_where if extra_where else None,
+        extra_params=extra_params if extra_params else None,
+    )
+
+    merged_pool = _merge_dedupe(kw + sem, top_k=pool_k)
+
+    
+    merged_pool = _lexical_rerank(merged_pool, query=query, domain=domain)
+
+    merged = merged_pool[:top_k]
 
     best_score = float(merged[0]["score"]) if merged else 0.0
     looks_doc = _looks_like_document_title(query)
     has_pdf = any(r.get("source_type") == "pdf_ocr" for r in merged)
 
+    
     if looks_doc and (not has_pdf):
         pdf_scope = ["pdf_ocr"]
-        sem2 = semantic_retrieve(query, top_k=top_k, source_types=pdf_scope)
-        merged = _merge_dedupe(sem2 + merged, top_k=top_k)
+        sem2 = semantic_retrieve(query, top_k=pool_k, source_types=pdf_scope)
+        merged2 = _merge_dedupe(sem2 + merged_pool, top_k=pool_k)
+        merged2 = _lexical_rerank(merged2, query=query, domain="document")
+        merged = merged2[:top_k]
         for s in pdf_scope:
             if s not in scope:
                 scope.append(s)
 
+
     if looks_doc and best_score < 0.50:
         pdf_scope = ["pdf_ocr"]
-        sem2 = semantic_retrieve(query, top_k=top_k, source_types=pdf_scope)
-        merged = _merge_dedupe(sem2 + merged, top_k=top_k)
+        sem2 = semantic_retrieve(query, top_k=pool_k, source_types=pdf_scope)
+        merged2 = _merge_dedupe(sem2 + merged_pool, top_k=pool_k)
+        merged2 = _lexical_rerank(merged2, query=query, domain="document")
+        merged = merged2[:top_k]
         for s in pdf_scope:
             if s not in scope:
                 scope.append(s)

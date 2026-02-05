@@ -10,22 +10,33 @@ from pydantic import BaseModel
 
 from app.chat_service import chat_pipeline
 from rag.retrieve_core import _get_embed_model
+from fastapi import Request, Response
 
+app = FastAPI()
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class UTF8JSONResponse(JSONResponse):
     def render(self, content) -> bytes:
         return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
 
-app = FastAPI(title="PAMS-AI Agent")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.options("/chat")
+def chat_options(request: Request):
+    return Response(status_code=200)
 
 
 @app.on_event("startup")
